@@ -1,6 +1,7 @@
 {-# LANGUAGE BinaryLiterals #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 -- |
 -- Module      : Louis
@@ -32,6 +33,7 @@ module Louis
   ( braillizeDynamicImage
   , braillizeByteString
   , braillizeFile
+  , resizeImageWidth
   ) where
 
 import Data.Word
@@ -60,53 +62,55 @@ renderChunk x = chr (bgroup * groupSize + boffset + ord '⠀')
     groupSize = 64
 
 chunkifyGreyScale :: Image Pixel8 -> [[Chunk]]
-chunkifyGreyScale img =
-  [ [chunkAt (i * 2, j * 4) | i <- [0 .. chunksWidth - 1]]
-  | j <- [0 .. chunksHeight - 1]
-  ]
-  where
-    width = imageWidth img
-    height = imageHeight img
-    chunksWidth = width `div` 2
-    chunksHeight = height `div` 4
-    squashBits :: [Word8] -> Word8
-    squashBits = foldl' (\acc x -> shiftL acc 1 .|. x) 0
-    threshold =
-      let imgData = imageData img
-       in round $
-          (/ (fromIntegral $ V.length imgData)) $
-          V.foldl' (+) (0.0 :: Float) $ V.map fromIntegral imgData
-    k :: Pixel8 -> Word8
-    k x
-      | x < threshold = 0
-      | otherwise = 1
-    f :: (Int, Int) -> Word8
-    f (x, y)
-      | 0 <= x && x < width && 0 <= y && y < height = k $ pixelAt img x y
-      | otherwise = 0
-    chunkAt :: (Int, Int) -> Chunk
-    chunkAt (x, y) =
-      squashBits $ reverse [f (i + x, j + y) | i <- [0, 1], j <- [0 .. 3]]
+chunkifyGreyScale =
+  let squashBits :: [Word8] -> Word8
+      squashBits = foldl' (\acc x -> shiftL acc 1 .|. x) 0
+      k :: Image Pixel8 -> Word8 -> Pixel8 -> Word8
+      k img threshold x
+        | x < threshold = 0
+        | otherwise = 1
+      f :: Image Pixel8 -> Word8 -> (Int, Int) -> Word8
+      f img threshold (x, y)
+        | 0 <= x && x < (imageWidth img) && 0 <= y && y < (imageHeight img) =
+          k img threshold $ pixelAt img x y
+        | otherwise = 0
+      chunkAt :: Image Pixel8 -> Word8 -> (Int, Int) -> Chunk
+      chunkAt img threshold (x, y) =
+        squashBits $ reverse [f img threshold (i + x, j + y) | i <- [0, 1], j <- [0 .. 3]]
+   in \img ->
+    let width = imageWidth img
+        height = imageHeight img
+        chunksWidth = width `div` 2
+        chunksHeight = height `div` 4
+        threshold =
+          let imgData = imageData img
+          in round
+             $ fromIntegral
+             (V.foldl' (flip (.) fromIntegral . (+)) (0 :: Word32) imgData)
+             / (fromIntegral $ V.length imgData)
+    in [ [chunkAt img threshold (i * 2, j * 4)
+         | i <- [0 .. chunksWidth - 1]
+         ]
+       | j <- [0 .. chunksHeight - 1]
+       ]
 
-greyScaleImage :: DynamicImage -> Image Pixel8
-greyScaleImage = pixelMap greyScalePixel . convertRGBA8
+greyScaleImage :: Image PixelRGBA8 -> Image Pixel8
+greyScaleImage = pixelMap greyScalePixel
   -- reference: https://www.mathworks.com/help/matlab/ref/rgb2gray.html
   where
     greyScalePixel :: PixelRGBA8 -> Pixel8
-    greyScalePixel (PixelRGBA8 r g b a) = k
-      where
-        k = round ((r' * 0.299 + g' * 0.587 + b' * 0.114) * a')
-        r' = fromIntegral r :: Float
-        g' = fromIntegral g :: Float
-        b' = fromIntegral b :: Float
-        a' = (fromIntegral a :: Float) / 255.0
+    greyScalePixel (PixelRGBA8 r g b a) = round
+      ((fromIntegral r * 0.299
+        + fromIntegral g * 0.587
+        + fromIntegral b * 0.114)
+       * fromIntegral a / 255.0)
 
 braillizeGreyScale :: Image Pixel8 -> [T.Text]
 braillizeGreyScale =
   map T.pack . getCompose . fmap renderChunk . Compose . chunkifyGreyScale
 
 resizeImageWidth :: Pixel a => Int -> Image a -> Image a
-resizeImageWidth width' image
+resizeImageWidth width' image'
   | width /= width' =
     let ratio :: Float
         ratio = fromIntegral width' / fromIntegral width
@@ -115,28 +119,25 @@ resizeImageWidth width' image
         y_interval = fromIntegral height / fromIntegral height'
         x_interval :: Float
         x_interval = fromIntegral width / fromIntegral width'
-        resizedData =
-          [ imgData V.! idx
-          | y <- [0 .. (height' - 1)]
-          , x <- [0 .. (width' - 1)]
-          , let idx =
-                  floor (fromIntegral y * y_interval) * width +
-                  floor (fromIntegral x * x_interval)
-          ]
-     in Image width' height' $ V.fromList resizedData
-  | otherwise = image
+        resizedImage = generateImage
+          (\x y -> pixelAt image'
+                   (floor $ fromIntegral x * x_interval)
+                   (floor $ fromIntegral y * y_interval))
+          width'
+          height'
+     in resizedImage
+  | otherwise = image'
   where
-    width = imageWidth image
-    height = imageHeight image
-    imgData = imageData image
+    width = imageWidth image'
+    height = imageHeight image'
 
-braillizeDynamicImage :: DynamicImage -> [T.Text]
-braillizeDynamicImage = braillizeGreyScale . resizeImageWidth 60 . greyScaleImage
+braillizeDynamicImage :: Int -> DynamicImage -> [T.Text]
+braillizeDynamicImage width = braillizeGreyScale . greyScaleImage . resizeImageWidth width . convertRGBA8
 
-braillizeByteString :: BS.ByteString -> Either String [T.Text]
-braillizeByteString bytes = braillizeDynamicImage <$> decodeImage bytes
+braillizeByteString :: Int -> BS.ByteString -> Either String [T.Text]
+braillizeByteString width bytes = braillizeDynamicImage width <$> decodeImage bytes
 
-braillizeFile :: FilePath -> IO [T.Text]
-braillizeFile filePath = do
+braillizeFile :: Int -> FilePath -> IO [T.Text]
+braillizeFile width filePath = do
   bytes <- BS.readFile filePath
-  either error return $ braillizeByteString bytes
+  either error return $ braillizeByteString width bytes
